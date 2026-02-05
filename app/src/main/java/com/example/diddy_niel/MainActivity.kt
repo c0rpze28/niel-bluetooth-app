@@ -23,11 +23,11 @@ class MainActivity : ComponentActivity() {
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
-            // On Android 12+, check if BLUETOOTH_CONNECT was granted
             val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 permissions[Manifest.permission.BLUETOOTH_CONNECT] == true
             } else {
-                true // Permissions are handled by manifest on older versions
+                // On older versions, location is also needed for BLE
+                permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true
             }
 
             if (granted) {
@@ -40,18 +40,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Version check for runtime permissions
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            requestPermissionLauncher.launch(
-                arrayOf(
-                    Manifest.permission.BLUETOOTH_CONNECT,
-                    Manifest.permission.BLUETOOTH_SCAN
-                )
-            )
+        val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
         } else {
-            // Android 11 and below don't need these runtime permissions
-            initializeBluetooth()
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
         }
+        requestPermissionLauncher.launch(permissions)
 
         setContent {
             DiddynielTheme {
@@ -88,7 +82,8 @@ class MainActivity : ComponentActivity() {
             val device = adapter?.bondedDevices?.firstOrNull()
 
             if (device != null) {
-                bluetooth = BluetoothNiNiel(device)
+                // Context is now required for BLE
+                bluetooth = BluetoothNiNiel(this, device)
                 thread {
                     try {
                         bluetooth?.connect()
@@ -98,7 +93,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
         } catch (e: SecurityException) {
-            // This can still happen if permissions aren't declared in Manifest
             e.printStackTrace()
         }
     }
@@ -111,10 +105,18 @@ fun ThermostatScreen(
     onDecrease: () -> Unit,
     onRefresh: ((String) -> Unit) -> Unit
 ) {
-    var temperature by remember { mutableStateOf("Loading...") }
+    var temperatureText by remember { mutableStateOf("Loading...") }
+    
+    // Parse numeric value to enforce limits
+    val currentTemp = remember(temperatureText) {
+        temperatureText.filter { it.isDigit() || it == '.' }.toDoubleOrNull()
+    }
+
+    val minLimit = 15.0
+    val maxLimit = 60.0
 
     LaunchedEffect(Unit) {
-        onRefresh { newTemp -> temperature = newTemp }
+        onRefresh { newTemp -> temperatureText = newTemp }
     }
 
     Column(
@@ -123,17 +125,38 @@ fun ThermostatScreen(
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text(text = "Current Temperature", style = MaterialTheme.typography.headlineSmall)
-        Text(text = temperature, style = MaterialTheme.typography.displayLarge)
+        Text(text = if (temperatureText.isEmpty()) "..." else temperatureText, 
+             style = MaterialTheme.typography.displayLarge)
+        
         Spacer(modifier = Modifier.height(32.dp))
+        
         Row(
             modifier = Modifier.padding(16.dp),
             horizontalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            Button(onClick = onDecrease) { Text("-") }
-            Button(onClick = onIncrease) { Text("+") }
+            // Disable Decrease button if at or below 15C
+            Button(
+                onClick = onDecrease,
+                enabled = currentTemp == null || currentTemp > minLimit
+            ) { Text("-") }
+            
+            // Disable Increase button if at or above 60C
+            Button(
+                onClick = onIncrease,
+                enabled = currentTemp == null || currentTemp < maxLimit
+            ) { Text("+") }
         }
-        Button(onClick = { onRefresh { newTemp -> temperature = newTemp } }) {
+        
+        Button(onClick = { onRefresh { newTemp -> temperatureText = newTemp } }) {
             Text("Refresh")
+        }
+
+        if (currentTemp != null) {
+            if (currentTemp <= minLimit) {
+                Text("Minimum limit reached (15°C)", color = MaterialTheme.colorScheme.error)
+            } else if (currentTemp >= maxLimit) {
+                Text("Maximum limit reached (60°C)", color = MaterialTheme.colorScheme.error)
+            }
         }
     }
 }
