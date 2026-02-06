@@ -1,9 +1,18 @@
 package com.example.diddy_niel
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.Context
+import android.content.SharedPreferences
 import android.os.Build
 import android.os.Bundle
+import android.os.ParcelUuid
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -26,15 +35,21 @@ import kotlin.concurrent.thread
 class MainActivity : ComponentActivity() {
 
     private var bluetooth by mutableStateOf<BluetoothNiNiel?>(null)
-    private val DEBUG_MODE = false // Toggle this for real Bluetooth or Mock data
+    private val DEBUG_MODE = false
     private var mockTemperature = 25.0
     private var mockIsOn = true
+
+    private lateinit var sharedPrefs: SharedPreferences
+    private val PREF_MAC_KEY = "last_device_mac"
+    private val TARGET_DEVICE_NAME = "ESP32-C3-NUS"
+    private var isScanning = false
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
             val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 permissions[Manifest.permission.BLUETOOTH_CONNECT] == true &&
-                permissions[Manifest.permission.BLUETOOTH_SCAN] == true
+                permissions[Manifest.permission.BLUETOOTH_SCAN] == true &&
+                permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true
             } else {
                 permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true
             }
@@ -49,63 +64,44 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        sharedPrefs = getSharedPreferences("ble_prefs", Context.MODE_PRIVATE)
+
         if (!DEBUG_MODE) {
             val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
+                arrayOf(
+                    Manifest.permission.BLUETOOTH_CONNECT,
+                    Manifest.permission.BLUETOOTH_SCAN,
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
             } else {
-                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
             }
             requestPermissionLauncher.launch(permissions)
         }
 
         setContent {
             DiddynielTheme {
-                val snackbarHostState = remember { SnackbarHostState() }
-                
-                // Collect state from Bluetooth flow if available
-                val bluetoothData by bluetooth?.receivedData?.collectAsState("Searching...") ?: remember { mutableStateOf("No Device Found") }
+                val bluetoothData by bluetooth?.receivedData?.collectAsState("Searching...") ?: remember { mutableStateOf("Ready to Connect") }
                 
                 Scaffold(
-                    topBar = { TopAppBar(title = { Text("Thermostat Controller ${if (DEBUG_MODE) "(MOCK)" else ""}") }) },
-                    snackbarHost = { SnackbarHost(snackbarHostState) }
+                    topBar = { TopAppBar(title = { Text("Thermostat Controller") }) }
                 ) { padding ->
                     ThermostatScreen(
                         modifier = Modifier.padding(padding),
                         statusText = if (DEBUG_MODE) (if (mockIsOn) "%.1f".format(mockTemperature) else "OFF") else bluetoothData,
-                        onSetHot = { 
-                            if (DEBUG_MODE) {
-                                mockTemperature = 45.0
-                            } else {
-                                thread { bluetooth?.send("HOT") }
-                            }
-                        },
-                        onSetCold = { 
-                            if (DEBUG_MODE) {
-                                mockTemperature = 18.0
-                            } else {
-                                thread { bluetooth?.send("COLD") } 
-                            }
-                        },
-                        onTurnOn = {
-                            if (DEBUG_MODE) {
-                                mockIsOn = true
-                            } else {
-                                thread { bluetooth?.send("ON") }
-                            }
-                        },
-                        onTurnOff = {
-                            if (DEBUG_MODE) {
-                                mockIsOn = false
-                            } else {
-                                thread { bluetooth?.send("OFF") }
-                            }
-                        },
+                        onSetHot = { if (DEBUG_MODE) mockTemperature = 45.0 else thread { bluetooth?.send("HOT") } },
+                        onSetCold = { if (DEBUG_MODE) mockTemperature = 18.0 else thread { bluetooth?.send("COLD") } },
+                        onTurnOn = { if (DEBUG_MODE) mockIsOn = true else thread { bluetooth?.send("ON") } },
+                        onTurnOff = { if (DEBUG_MODE) mockIsOn = false else thread { bluetooth?.send("OFF") } },
                         onRefresh = {
-                            if (DEBUG_MODE) {
-                                // In mock mode, we just trigger a UI update indirectly
-                                mockTemperature += (Math.random() - 0.5)
-                            } else {
-                                thread { bluetooth?.send("GET") }
+                            if (DEBUG_MODE) mockTemperature += (Math.random() - 0.5)
+                            else {
+                                if (bluetooth == null || bluetoothData == "Disconnected") initializeBluetooth()
+                                else thread { bluetooth?.send("GET") }
                             }
                         }
                     )
@@ -115,30 +111,103 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun initializeBluetooth() {
-        try {
-            val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
-            val adapter = manager.adapter
-            // Note: ESP32 C3 should be paired in Android Settings first
-            val device = adapter?.bondedDevices?.firstOrNull()
+        val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+        val adapter = manager.adapter ?: return
 
-            if (device != null) {
-                val bt = BluetoothNiNiel(this, device)
-                bluetooth = bt
-                thread {
-                    try {
-                        bt.connect()
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
+        val cachedMac = sharedPrefs.getString(PREF_MAC_KEY, null)
+        if (cachedMac != null) {
+            Log.d("MainActivity", "Found cached MAC: $cachedMac. Attempting direct connection.")
+            connectToDevice(adapter.getRemoteDevice(cachedMac))
+        } else {
+            startScan(adapter)
+        }
+    }
+
+    private val scanCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            val device = result.device
+            @Suppress("MissingPermission")
+            val deviceName = device.name ?: result.scanRecord?.deviceName ?: "Unknown"
+            
+            // Check for the Service UUID in the scan record - much more reliable than name
+            val serviceUuids = result.scanRecord?.serviceUuids
+            val hasUartService = serviceUuids?.any { it.uuid == BluetoothNiNiel.SERVICE_UUID } ?: false
+
+            Log.d("MainActivity", "Scanned: $deviceName ($hasUartService) - ${device.address}")
+
+            if (deviceName == TARGET_DEVICE_NAME || hasUartService) {
+                Log.d("MainActivity", "MATCH FOUND! Connecting to ${device.address}")
+                stopScan()
+                sharedPrefs.edit().putString(PREF_MAC_KEY, device.address).apply()
+                connectToDevice(device)
             }
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            Log.e("MainActivity", "Scan failed with error: $errorCode")
+            isScanning = false
+        }
+    }
+
+    private fun startScan(adapter: BluetoothAdapter) {
+        if (isScanning) return
+        val scanner = adapter.bluetoothLeScanner ?: return
+        
+        Log.d("MainActivity", "Starting smart scan...")
+        isScanning = true
+        
+        // Scan specifically for the UART service UUID
+        val filter = ScanFilter.Builder()
+            .setServiceUuid(ParcelUuid(BluetoothNiNiel.SERVICE_UUID))
+            .build()
+            
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+
+        try {
+            scanner.startScan(listOf(filter), settings, scanCallback)
+        } catch (e: SecurityException) {
+            // Fallback for older permissions
+            scanner.startScan(scanCallback)
+        }
+    }
+
+    private fun stopScan() {
+        if (!isScanning) return
+        val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+        val scanner = manager.adapter?.bluetoothLeScanner ?: return
+        
+        Log.d("MainActivity", "Stopping scan.")
+        try {
+            scanner.stopScan(scanCallback)
+            isScanning = false
         } catch (e: SecurityException) {
             e.printStackTrace()
         }
     }
 
+    private fun connectToDevice(device: android.bluetooth.BluetoothDevice) {
+        val bt = BluetoothNiNiel(this, device)
+        bt.onConnectionFailed = {
+            Log.w("MainActivity", "Direct connection failed. Clearing cache and scanning.")
+            sharedPrefs.edit().remove(PREF_MAC_KEY).apply()
+            val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+            manager.adapter?.let { startScan(it) }
+        }
+        bluetooth = bt
+        thread {
+            try {
+                bt.connect()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        stopScan()
         bluetooth?.close()
     }
 }
@@ -157,7 +226,12 @@ fun ThermostatScreen(
         statusText.filter { it.isDigit() || it == '.' }.toDoubleOrNull()
     }
     
-    val isOn = statusText != "OFF" && statusText != "Disconnected" && statusText != "Searching..." && statusText != "No Device Found"
+    val isOn = !statusText.contains("OFF", ignoreCase = true) && 
+               !statusText.contains("Disconnected", ignoreCase = true) && 
+               !statusText.contains("Searching", ignoreCase = true) && 
+               !statusText.contains("No Device", ignoreCase = true) && 
+               !statusText.contains("Ready to Connect", ignoreCase = true) && 
+               !statusText.contains("Connecting", ignoreCase = true)
 
     Column(
         modifier = modifier.fillMaxSize(),
@@ -225,7 +299,7 @@ fun ThermostatScreen(
         Spacer(modifier = Modifier.height(16.dp))
 
         Button(onClick = onRefresh) {
-            Text("Refresh")
+            Text(if (statusText == "Ready to Connect" || statusText == "Disconnected" || statusText == "Searching...") "Connect" else "Refresh")
         }
     }
 }
