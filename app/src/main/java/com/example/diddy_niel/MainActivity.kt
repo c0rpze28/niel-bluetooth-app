@@ -11,6 +11,8 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -43,6 +45,8 @@ class MainActivity : ComponentActivity() {
     private val PREF_MAC_KEY = "last_device_mac"
     private val TARGET_DEVICE_NAME = "ESP32-C3-NUS"
     private var isScanning = false
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var connectionTimeoutRunnable: Runnable? = null
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
@@ -100,8 +104,18 @@ class MainActivity : ComponentActivity() {
                         onRefresh = {
                             if (DEBUG_MODE) mockTemperature += (Math.random() - 0.5)
                             else {
-                                if (bluetooth == null || bluetoothData == "Disconnected") initializeBluetooth()
-                                else thread { bluetooth?.send("GET") }
+                                // If stuck in Connecting or Searching, allow a manual retry
+                                val isNotConnected = bluetooth == null || 
+                                                     bluetoothData == "Disconnected" || 
+                                                     bluetoothData == "Ready to Connect" ||
+                                                     bluetoothData == "Searching..." ||
+                                                     bluetoothData == "Connecting..."
+                                
+                                if (isNotConnected) {
+                                    initializeBluetooth()
+                                } else {
+                                    thread { bluetooth?.send("GET") }
+                                }
                             }
                         }
                     )
@@ -114,10 +128,19 @@ class MainActivity : ComponentActivity() {
         val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
         val adapter = manager.adapter ?: return
 
+        stopScan()
+        cancelConnectionTimeout()
+
         val cachedMac = sharedPrefs.getString(PREF_MAC_KEY, null)
         if (cachedMac != null) {
             Log.d("MainActivity", "Found cached MAC: $cachedMac. Attempting direct connection.")
-            connectToDevice(adapter.getRemoteDevice(cachedMac))
+            try {
+                connectToDevice(adapter.getRemoteDevice(cachedMac))
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Cached device error: ${e.message}")
+                sharedPrefs.edit().remove(PREF_MAC_KEY).apply()
+                startScan(adapter)
+            }
         } else {
             startScan(adapter)
         }
@@ -129,7 +152,6 @@ class MainActivity : ComponentActivity() {
             @Suppress("MissingPermission")
             val deviceName = device.name ?: result.scanRecord?.deviceName ?: "Unknown"
             
-            // Check for the Service UUID in the scan record - much more reliable than name
             val serviceUuids = result.scanRecord?.serviceUuids
             val hasUartService = serviceUuids?.any { it.uuid == BluetoothNiNiel.SERVICE_UUID } ?: false
 
@@ -156,7 +178,6 @@ class MainActivity : ComponentActivity() {
         Log.d("MainActivity", "Starting smart scan...")
         isScanning = true
         
-        // Scan specifically for the UART service UUID
         val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(BluetoothNiNiel.SERVICE_UUID))
             .build()
@@ -167,8 +188,13 @@ class MainActivity : ComponentActivity() {
 
         try {
             scanner.startScan(listOf(filter), settings, scanCallback)
+            mainHandler.postDelayed({
+                if (isScanning) {
+                    Log.d("MainActivity", "Scan timed out.")
+                    stopScan()
+                }
+            }, 10000)
         } catch (e: SecurityException) {
-            // Fallback for older permissions
             scanner.startScan(scanCallback)
         }
     }
@@ -181,21 +207,37 @@ class MainActivity : ComponentActivity() {
         Log.d("MainActivity", "Stopping scan.")
         try {
             scanner.stopScan(scanCallback)
-            isScanning = false
-        } catch (e: SecurityException) {
+        } catch (e: Exception) {
             e.printStackTrace()
+        } finally {
+            isScanning = false
+            mainHandler.removeCallbacksAndMessages(null)
         }
     }
 
     private fun connectToDevice(device: android.bluetooth.BluetoothDevice) {
+        bluetooth?.close()
+        cancelConnectionTimeout()
+        Thread.sleep(1000)
         val bt = BluetoothNiNiel(this, device)
         bt.onConnectionFailed = {
-            Log.w("MainActivity", "Direct connection failed. Clearing cache and scanning.")
+            Log.w("MainActivity", "Direct connection failed. Clearing cache.")
             sharedPrefs.edit().remove(PREF_MAC_KEY).apply()
-            val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
-            manager.adapter?.let { startScan(it) }
+            cancelConnectionTimeout()
         }
         bluetooth = bt
+
+        // Set a timeout watchdog: if not connected in 10s, clear cache and reset
+        connectionTimeoutRunnable = Runnable {
+            if (bt.receivedData.value == "Connecting...") {
+                Log.w("MainActivity", "Connection timed out. Resetting.")
+                bt.close()
+                sharedPrefs.edit().remove(PREF_MAC_KEY).apply()
+                // Let the UI state reflect Disconnected so user can try again
+            }
+        }
+        mainHandler.postDelayed(connectionTimeoutRunnable!!, 10000)
+
         thread {
             try {
                 bt.connect()
@@ -205,9 +247,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun cancelConnectionTimeout() {
+        connectionTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        connectionTimeoutRunnable = null
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         stopScan()
+        cancelConnectionTimeout()
         bluetooth?.close()
     }
 }
@@ -299,7 +347,12 @@ fun ThermostatScreen(
         Spacer(modifier = Modifier.height(16.dp))
 
         Button(onClick = onRefresh) {
-            Text(if (statusText == "Ready to Connect" || statusText == "Disconnected" || statusText == "Searching...") "Connect" else "Refresh")
+            val isActionConnect = statusText == "Ready to Connect" || 
+                                 statusText == "Disconnected" || 
+                                 statusText == "Searching..." ||
+                                 statusText == "Connecting..."
+            
+            Text(if (isActionConnect) "Connect" else "Refresh")
         }
     }
 }

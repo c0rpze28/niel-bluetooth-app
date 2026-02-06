@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.*
+import kotlin.concurrent.thread
 
 class BluetoothNiNiel(private val context: Context, private val device: BluetoothDevice) {
 
@@ -31,17 +32,20 @@ class BluetoothNiNiel(private val context: Context, private val device: Bluetoot
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                Log.d(TAG, "Connected. Requesting MTU...")
-                gatt.requestMtu(517)
+                Log.d(TAG, "Connected. Discovering services...")
+                thread {
+                    Thread.sleep(600)
+                    gatt.discoverServices()
+                }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                Log.d(TAG, "Disconnected. Status: $status")
                 _receivedData.value = "Disconnected"
+
+                // NOW close the gatt properly
+                gatt.close()  // ADD THIS LINE
+
                 if (status != BluetoothGatt.GATT_SUCCESS) onConnectionFailed?.invoke()
             }
-        }
-
-        @SuppressLint("MissingPermission")
-        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            gatt.discoverServices()
         }
 
         @SuppressLint("MissingPermission")
@@ -49,73 +53,71 @@ class BluetoothNiNiel(private val context: Context, private val device: Bluetoot
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 val service = gatt.getService(SERVICE_UUID)
                 writeCharacteristic = service?.getCharacteristic(RX_WRITE_UUID)
-                
                 val readChar = service?.getCharacteristic(TX_READ_UUID)
                 if (readChar != null) {
                     gatt.setCharacteristicNotification(readChar, true)
                     val descriptor = readChar.getDescriptor(CCCD_UUID)
-                    if (descriptor != null) {
-                        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        gatt.writeDescriptor(descriptor)
+                    descriptor?.let {
+                        it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        gatt.writeDescriptor(it)
                     }
+                    gatt.requestMtu(517) // Request MTU after service discovery
                 }
+            } else {
+                 _receivedData.value = "Discovery Failed"
             }
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "Handshake Complete. Ready.")
                 _receivedData.value = "Ready"
+                thread {
+                    Thread.sleep(500) // Wait for ESP32 to be ready
+                    send("GET")
+                }
             }
         }
-
+        
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             if (characteristic.uuid == TX_READ_UUID) {
                 val bytes = characteristic.value ?: return
-                
-                // --- IMPROVED CLEANING LOGIC ---
-                // We process the raw bytes to avoid UTF-8 conversion errors
-                val cleanValue = bytes
-                    .takeWhile { it.toInt() != 0 } // Stop at null terminator
-                    .map { it.toInt().toChar() } // Convert to Char
-                    .filter { it in ' '..'~' } // Keep only printable ASCII
-                    .joinToString("")
-                    .trim()
-
+                val cleanValue = bytes.takeWhile { it.toInt() != 0 }.map { it.toInt().toChar() }.joinToString("").trim()
                 if (cleanValue.isNotEmpty()) {
-                    Log.d(TAG, "Cleaned: $cleanValue")
                     _receivedData.value = cleanValue
                 }
             }
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.e(TAG, "Write failed: $status")
-            }
+            if (status != BluetoothGatt.GATT_SUCCESS) Log.e(TAG, "Write failed with status: $status")
         }
     }
 
     @SuppressLint("MissingPermission")
     fun connect() {
-        bluetoothGatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        _receivedData.value = "Connecting..."
+        thread {
+            Thread.sleep(500) // CRITICAL: Wait for old connection to die
+            bluetoothGatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        }
     }
 
     @SuppressLint("MissingPermission")
     fun send(command: String) {
+        val gatt = bluetoothGatt ?: return
         val char = writeCharacteristic ?: return
-        char.value = (command + "\n").toByteArray()
-        char.writeType = if ((char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0) {
-            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-        } else {
-            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        }
-        bluetoothGatt?.writeCharacteristic(char)
+        
+        // Your ESP32 code expects a raw string, not one with a newline
+        char.value = command.toByteArray()
+        char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        
+        gatt.writeCharacteristic(char)
     }
 
     @SuppressLint("MissingPermission")
     fun close() {
         bluetoothGatt?.disconnect()
-        bluetoothGatt?.close()
         bluetoothGatt = null
     }
 }
