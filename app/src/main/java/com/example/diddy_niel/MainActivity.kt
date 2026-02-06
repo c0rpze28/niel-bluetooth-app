@@ -11,6 +11,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AcUnit
+import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Thermostat
 import androidx.compose.material.icons.filled.Whatshot
 import androidx.compose.material3.*
@@ -27,6 +28,7 @@ class MainActivity : ComponentActivity() {
     private var bluetooth: BluetoothNiNiel? = null
     private val DEBUG_MODE = true // Toggle this for real Bluetooth or Mock data
     private var mockTemperature = 25.0
+    private var mockIsOn = true
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
@@ -64,26 +66,39 @@ class MainActivity : ComponentActivity() {
                 ) { padding ->
                     ThermostatScreen(
                         modifier = Modifier.padding(padding),
-                        onIncrease = { 
+                        onSetHot = { 
                             if (DEBUG_MODE) {
-                                mockTemperature += 0.5
+                                mockTemperature = 45.0
                             } else {
-                                thread { bluetooth?.send("UP") }
+                                thread { bluetooth?.send("HOT") }
                             }
                         },
-                        onDecrease = { 
+                        onSetCold = { 
                             if (DEBUG_MODE) {
-                                mockTemperature -= 0.5
+                                mockTemperature = 18.0
                             } else {
-                                thread { bluetooth?.send("DOWN") } 
+                                thread { bluetooth?.send("COLD") } 
+                            }
+                        },
+                        onTurnOn = {
+                            if (DEBUG_MODE) {
+                                mockIsOn = true
+                            } else {
+                                thread { bluetooth?.send("ON") }
+                            }
+                        },
+                        onTurnOff = {
+                            if (DEBUG_MODE) {
+                                mockIsOn = false
+                            } else {
+                                thread { bluetooth?.send("OFF") }
                             }
                         },
                         onRefresh = { update ->
                             if (DEBUG_MODE) {
-                                // Simulate network/bluetooth delay
                                 thread {
                                     Thread.sleep(500)
-                                    update("%.1f".format(mockTemperature))
+                                    update(if (mockIsOn) "%.1f".format(mockTemperature) else "OFF")
                                 }
                             } else {
                                 thread {
@@ -128,21 +143,22 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun ThermostatScreen(
     modifier: Modifier = Modifier,
-    onIncrease: () -> Unit,
-    onDecrease: () -> Unit,
+    onSetHot: () -> Unit,
+    onSetCold: () -> Unit,
+    onTurnOn: () -> Unit,
+    onTurnOff: () -> Unit,
     onRefresh: ((String) -> Unit) -> Unit
 ) {
-    var temperatureText by remember { mutableStateOf("Loading...") }
+    var statusText by remember { mutableStateOf("Loading...") }
     
-    val currentTemp = remember(temperatureText) {
-        temperatureText.filter { it.isDigit() || it == '.' }.toDoubleOrNull()
+    val currentTemp = remember(statusText) {
+        statusText.filter { it.isDigit() || it == '.' }.toDoubleOrNull()
     }
-
-    val minLimit = 15.0
-    val maxLimit = 60.0
+    
+    val isOn = statusText != "OFF" && statusText != "No connection" && statusText != "Loading..."
 
     LaunchedEffect(Unit) {
-        onRefresh { newTemp -> temperatureText = newTemp }
+        onRefresh { newStatus -> statusText = newStatus }
     }
 
     Column(
@@ -150,12 +166,12 @@ fun ThermostatScreen(
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // Dynamic Icon based on temperature
         val (icon, iconColor) = when {
+            !isOn -> Icons.Default.PowerSettingsNew to Color.Gray
             currentTemp == null -> Icons.Default.Thermostat to Color.Gray
-            currentTemp <= 20.0 -> Icons.Default.AcUnit to Color(0xFF03A9F4) // Blue/Ice
-            currentTemp >= 40.0 -> Icons.Default.Whatshot to Color(0xFFFF5722) // Orange/Hot
-            else -> Icons.Default.Thermostat to Color(0xFF4CAF50) // Green/Normal
+            currentTemp <= 20.0 -> Icons.Default.AcUnit to Color(0xFF03A9F4)
+            currentTemp >= 40.0 -> Icons.Default.Whatshot to Color(0xFFFF5722)
+            else -> Icons.Default.Thermostat to Color(0xFF4CAF50)
         }
 
         Icon(
@@ -167,49 +183,66 @@ fun ThermostatScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        Text(text = "Current Temperature", style = MaterialTheme.typography.headlineSmall)
+        Text(text = if (isOn) "Current Temperature" else "System Status", style = MaterialTheme.typography.headlineSmall)
         
-        val displayTemperature = if (currentTemp != null) "$temperatureText°C" else temperatureText
-        Text(text = displayTemperature, style = MaterialTheme.typography.displayLarge)
+        val displayText = if (currentTemp != null) "$statusText°C" else statusText
+        Text(text = displayText, style = MaterialTheme.typography.displayLarge)
         
         Spacer(modifier = Modifier.height(32.dp))
         
         Row(
-            modifier = Modifier.padding(16.dp),
+            modifier = Modifier.padding(8.dp),
             horizontalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Button(
                 onClick = {
-                    onDecrease()
-                    // Immediately refresh view in mock mode for better UX
-                    onRefresh { newTemp -> temperatureText = newTemp }
+                    onTurnOff()
+                    onRefresh { newStatus -> statusText = newStatus }
                 },
-                enabled = currentTemp != null && currentTemp > minLimit
-            ) { Text("-") }
+                enabled = isOn,
+                colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)
+            ) { Text("OFF") }
+
+            Button(
+                onClick = {
+                    onTurnOn()
+                    onRefresh { newStatus -> statusText = newStatus }
+                },
+                enabled = !isOn,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+            ) { Text("ON") }
+        }
+
+        Row(
+            modifier = Modifier.padding(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Button(
+                onClick = {
+                    onSetCold()
+                    onRefresh { newStatus -> statusText = newStatus }
+                },
+                enabled = isOn,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF03A9F4))
+            ) { Text("COLD") }
             
             Button(
                 onClick = {
-                    onIncrease()
-                    // Immediately refresh view in mock mode for better UX
-                    onRefresh { newTemp -> temperatureText = newTemp }
+                    onSetHot()
+                    onRefresh { newStatus -> statusText = newStatus }
                 },
-                enabled = currentTemp != null && currentTemp < maxLimit
-            ) { Text("+") }
+                enabled = isOn,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5722))
+            ) { Text("HOT") }
         }
         
+        Spacer(modifier = Modifier.height(16.dp))
+
         Button(onClick = { 
-            temperatureText = "Loading..."
-            onRefresh { newTemp -> temperatureText = newTemp } 
+            statusText = "Loading..."
+            onRefresh { newStatus -> statusText = newStatus }
         }) {
             Text("Refresh")
-        }
-
-        if (currentTemp != null) {
-            if (currentTemp <= minLimit) {
-                Text("Minimum limit reached (15°C)", color = MaterialTheme.colorScheme.error)
-            } else if (currentTemp >= maxLimit) {
-                Text("Maximum limit reached (60°C)", color = MaterialTheme.colorScheme.error)
-            }
         }
     }
 }
