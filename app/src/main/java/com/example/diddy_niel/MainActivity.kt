@@ -25,15 +25,16 @@ import kotlin.concurrent.thread
 
 class MainActivity : ComponentActivity() {
 
-    private var bluetooth: BluetoothNiNiel? = null
-    private val DEBUG_MODE = true // Toggle this for real Bluetooth or Mock data
+    private var bluetooth by mutableStateOf<BluetoothNiNiel?>(null)
+    private val DEBUG_MODE = false // Toggle this for real Bluetooth or Mock data
     private var mockTemperature = 25.0
     private var mockIsOn = true
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
             val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                permissions[Manifest.permission.BLUETOOTH_CONNECT] == true
+                permissions[Manifest.permission.BLUETOOTH_CONNECT] == true &&
+                permissions[Manifest.permission.BLUETOOTH_SCAN] == true
             } else {
                 permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true
             }
@@ -60,12 +61,17 @@ class MainActivity : ComponentActivity() {
         setContent {
             DiddynielTheme {
                 val snackbarHostState = remember { SnackbarHostState() }
+                
+                // Collect state from Bluetooth flow if available
+                val bluetoothData by bluetooth?.receivedData?.collectAsState("Searching...") ?: remember { mutableStateOf("No Device Found") }
+                
                 Scaffold(
                     topBar = { TopAppBar(title = { Text("Thermostat Controller ${if (DEBUG_MODE) "(MOCK)" else ""}") }) },
                     snackbarHost = { SnackbarHost(snackbarHostState) }
                 ) { padding ->
                     ThermostatScreen(
                         modifier = Modifier.padding(padding),
+                        statusText = if (DEBUG_MODE) (if (mockIsOn) "%.1f".format(mockTemperature) else "OFF") else bluetoothData,
                         onSetHot = { 
                             if (DEBUG_MODE) {
                                 mockTemperature = 45.0
@@ -94,22 +100,12 @@ class MainActivity : ComponentActivity() {
                                 thread { bluetooth?.send("OFF") }
                             }
                         },
-                        onRefresh = { update ->
+                        onRefresh = {
                             if (DEBUG_MODE) {
-                                thread {
-                                    Thread.sleep(500)
-                                    update(if (mockIsOn) "%.1f".format(mockTemperature) else "OFF")
-                                }
+                                // In mock mode, we just trigger a UI update indirectly
+                                mockTemperature += (Math.random() - 0.5)
                             } else {
-                                thread {
-                                    try {
-                                        bluetooth?.send("GET")
-                                        val response = bluetooth?.read() ?: "No connection"
-                                        update(response)
-                                    } catch (e: Exception) {
-                                        e.printStackTrace()
-                                    }
-                                }
+                                thread { bluetooth?.send("GET") }
                             }
                         }
                     )
@@ -122,13 +118,15 @@ class MainActivity : ComponentActivity() {
         try {
             val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
             val adapter = manager.adapter
+            // Note: ESP32 C3 should be paired in Android Settings first
             val device = adapter?.bondedDevices?.firstOrNull()
 
             if (device != null) {
-                bluetooth = BluetoothNiNiel(this, device)
+                val bt = BluetoothNiNiel(this, device)
+                bluetooth = bt
                 thread {
                     try {
-                        bluetooth?.connect()
+                        bt.connect()
                     } catch (e: Exception) {
                         e.printStackTrace()
                     }
@@ -138,28 +136,28 @@ class MainActivity : ComponentActivity() {
             e.printStackTrace()
         }
     }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        bluetooth?.close()
+    }
 }
 
 @Composable
 fun ThermostatScreen(
     modifier: Modifier = Modifier,
+    statusText: String,
     onSetHot: () -> Unit,
     onSetCold: () -> Unit,
     onTurnOn: () -> Unit,
     onTurnOff: () -> Unit,
-    onRefresh: ((String) -> Unit) -> Unit
+    onRefresh: () -> Unit
 ) {
-    var statusText by remember { mutableStateOf("Loading...") }
-    
     val currentTemp = remember(statusText) {
         statusText.filter { it.isDigit() || it == '.' }.toDoubleOrNull()
     }
     
-    val isOn = statusText != "OFF" && statusText != "No connection" && statusText != "Loading..."
-
-    LaunchedEffect(Unit) {
-        onRefresh { newStatus -> statusText = newStatus }
-    }
+    val isOn = statusText != "OFF" && statusText != "Disconnected" && statusText != "Searching..." && statusText != "No Device Found"
 
     Column(
         modifier = modifier.fillMaxSize(),
@@ -195,19 +193,13 @@ fun ThermostatScreen(
             horizontalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Button(
-                onClick = {
-                    onTurnOff()
-                    onRefresh { newStatus -> statusText = newStatus }
-                },
+                onClick = onTurnOff,
                 enabled = isOn,
                 colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)
             ) { Text("OFF") }
 
             Button(
-                onClick = {
-                    onTurnOn()
-                    onRefresh { newStatus -> statusText = newStatus }
-                },
+                onClick = onTurnOn,
                 enabled = !isOn,
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
             ) { Text("ON") }
@@ -218,19 +210,13 @@ fun ThermostatScreen(
             horizontalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Button(
-                onClick = {
-                    onSetCold()
-                    onRefresh { newStatus -> statusText = newStatus }
-                },
+                onClick = onSetCold,
                 enabled = isOn,
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF03A9F4))
             ) { Text("COLD") }
             
             Button(
-                onClick = {
-                    onSetHot()
-                    onRefresh { newStatus -> statusText = newStatus }
-                },
+                onClick = onSetHot,
                 enabled = isOn,
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5722))
             ) { Text("HOT") }
@@ -238,10 +224,7 @@ fun ThermostatScreen(
         
         Spacer(modifier = Modifier.height(16.dp))
 
-        Button(onClick = { 
-            statusText = "Loading..."
-            onRefresh { newStatus -> statusText = newStatus }
-        }) {
+        Button(onClick = onRefresh) {
             Text("Refresh")
         }
     }

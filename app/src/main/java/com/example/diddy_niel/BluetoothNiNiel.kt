@@ -4,13 +4,18 @@ import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.util.*
 
 class BluetoothNiNiel(private val context: Context, private val device: BluetoothDevice) {
 
     private var bluetoothGatt: BluetoothGatt? = null
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
-    private var lastReceivedValue: String = "No data"
+    
+    private val _receivedData = MutableStateFlow("Loading...")
+    val receivedData: StateFlow<String> = _receivedData.asStateFlow()
 
     companion object {
         private const val TAG = "BluetoothNiNiel"
@@ -27,9 +32,11 @@ class BluetoothNiNiel(private val context: Context, private val device: Bluetoot
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 Log.d(TAG, "Connected to GATT server.")
+                _receivedData.value = "Connected"
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.d(TAG, "Disconnected from GATT server.")
+                _receivedData.value = "Disconnected"
             }
         }
 
@@ -59,8 +66,9 @@ class BluetoothNiNiel(private val context: Context, private val device: Bluetoot
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             if (characteristic.uuid == TX_READ_UUID) {
-                lastReceivedValue = String(characteristic.value).trim()
-                Log.d(TAG, "Received: $lastReceivedValue")
+                val value = String(characteristic.value).trim()
+                Log.d(TAG, "Received: $value")
+                _receivedData.value = value
             }
         }
 
@@ -84,10 +92,6 @@ class BluetoothNiNiel(private val context: Context, private val device: Bluetoot
         // Use WRITE_TYPE_DEFAULT for reliable 5.0 communication
         char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         bluetoothGatt?.writeCharacteristic(char)
-    }
-
-    fun read(): String {
-        return lastReceivedValue
     }
 
     @SuppressLint("MissingPermission")
