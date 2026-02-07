@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
+#include <Preferences.h>
 
 // -----------------------------
 // Pins
@@ -24,7 +25,7 @@
 // -----------------------------
 int currentState = 0;
 
-// Desired temperature thresholds
+// Desired temperature thresholds (now modifiable via BLE)
 float desiredCold = 20.0;
 float desiredHot  = 50.0;
 
@@ -33,6 +34,10 @@ float desiredHot  = 50.0;
 #define TEMP_MAX 60.0
 #define ANALOG_MIN 1965
 #define ANALOG_MAX 1470
+
+// Temperature limits
+#define MIN_COLD_LIMIT 18.0
+#define MAX_HOT_LIMIT 65.0
 
 // -----------------------------
 // BLE UUIDs (NUS)
@@ -45,6 +50,9 @@ NimBLEServer* pServer = nullptr;
 NimBLECharacteristic* pRxCharacteristic = nullptr;
 NimBLECharacteristic* pTxCharacteristic = nullptr;
 
+// Preferences for storing temperature limits
+Preferences preferences;
+
 // -----------------------------
 // Function declarations
 // -----------------------------
@@ -53,6 +61,8 @@ void stopMotor();
 float analogToTemp(int sensorValue);
 void setupBLE();
 void handleCommand(const std::string& cmd);
+void loadTemperatureLimits();
+void saveTemperatureLimits();
 
 // -----------------------------
 // Setup
@@ -67,6 +77,10 @@ void setup() {
     ledcAttachPin(EN_PIN, PWM_CHANNEL);
 
     stopMotor();
+    
+    // Load saved temperature limits from flash
+    loadTemperatureLimits();
+    
     setupBLE();
 }
 
@@ -81,6 +95,8 @@ void loop() {
     // Debug
     Serial.print("Temp: "); Serial.print(tempC, 1); Serial.print("°C | Analog0: ");
     Serial.print(sensorValue); Serial.print(" | Analog2: "); Serial.println(sensorValue2);
+    Serial.print("Limits - Cold: "); Serial.print(desiredCold, 1); 
+    Serial.print("°C | Hot: "); Serial.print(desiredHot, 1); Serial.println("°C");
 
     // Motor control based on temperature
     if (tempC < desiredCold && currentState != 1) {
@@ -137,6 +153,33 @@ float analogToTemp(int sensorValue) {
 }
 
 // -----------------------------
+// Temperature limit management
+// -----------------------------
+void loadTemperatureLimits() {
+    preferences.begin("thermostat", false);
+    desiredCold = preferences.getFloat("coldLimit", 20.0);
+    desiredHot = preferences.getFloat("hotLimit", 50.0);
+    preferences.end();
+    
+    Serial.println("========================================");
+    Serial.print("Loaded limits - Cold: ");
+    Serial.print(desiredCold, 1);
+    Serial.print("°C | Hot: ");
+    Serial.print(desiredHot, 1);
+    Serial.println("°C");
+    Serial.println("========================================");
+}
+
+void saveTemperatureLimits() {
+    preferences.begin("thermostat", false);
+    preferences.putFloat("coldLimit", desiredCold);
+    preferences.putFloat("hotLimit", desiredHot);
+    preferences.end();
+    
+    Serial.println("Temperature limits saved to flash.");
+}
+
+// -----------------------------
 // BLE setup
 // -----------------------------
 class RxCallbacks : public NimBLECharacteristicCallbacks {
@@ -161,7 +204,6 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         Serial.println("Advertising restarted");
     }
     
-    // ADD THIS - This is the key fix
     uint32_t onPassKeyRequest() {
         Serial.println("PassKey Request");
         return 123456;
@@ -199,12 +241,11 @@ void setupBLE() {
 
     // CCCD descriptor (required for notifications)
     NimBLEDescriptor* cccd = new NimBLEDescriptor(
-        "2902",      // UUID as string
-        0,           // properties (0 is fine for CCCD)
-        2,           // max length
+        "2902",
+        0,
+        2,
         pTxCharacteristic
     );
-    // initialize CCCD value to 0x00 0x00 (notifications off by default)
     uint8_t cccd_value[2] = {0x00, 0x00};
     cccd->setValue(cccd_value, 2);
     pTxCharacteristic->addDescriptor(cccd);
@@ -218,17 +259,74 @@ void setupBLE() {
     Serial.println("BLE NUS server started and advertising.");
 }
 
-
 // -----------------------------
 // Handle commands from app
 // -----------------------------
 void handleCommand(const std::string& cmd) {
+    // Check for SETHOT command
+    if (cmd.rfind("SETHOT ", 0) == 0) {
+        std::string tempStr = cmd.substr(7); // Get everything after "SETHOT "
+        float newHot = atof(tempStr.c_str());
+        
+        // Validate temperature
+        if (newHot >= desiredCold + 1.0 && newHot <= MAX_HOT_LIMIT) {
+            desiredHot = newHot;
+            saveTemperatureLimits();
+            
+            Serial.println("========================================");
+            Serial.print("Hot limit updated to: ");
+            Serial.print(desiredHot, 1);
+            Serial.println("°C");
+            Serial.println("========================================");
+        } else {
+            Serial.println("========================================");
+            Serial.println("ERROR: Invalid hot temperature limit!");
+            Serial.print("Must be between ");
+            Serial.print(desiredCold + 1.0, 1);
+            Serial.print("°C and ");
+            Serial.print(MAX_HOT_LIMIT, 1);
+            Serial.println("°C");
+            Serial.println("========================================");
+        }
+        return;
+    }
+    
+    // Check for SETCOLD command
+    if (cmd.rfind("SETCOLD ", 0) == 0) {
+        std::string tempStr = cmd.substr(8); // Get everything after "SETCOLD "
+        float newCold = atof(tempStr.c_str());
+        
+        // Validate temperature
+        if (newCold >= MIN_COLD_LIMIT && newCold <= desiredHot - 1.0) {
+            desiredCold = newCold;
+            saveTemperatureLimits();
+            
+            Serial.println("========================================");
+            Serial.print("Cold limit updated to: ");
+            Serial.print(desiredCold, 1);
+            Serial.println("°C");
+            Serial.println("========================================");
+        } else {
+            Serial.println("========================================");
+            Serial.println("ERROR: Invalid cold temperature limit!");
+            Serial.print("Must be between ");
+            Serial.print(MIN_COLD_LIMIT, 1);
+            Serial.print("°C and ");
+            Serial.print(desiredHot - 1.0, 1);
+            Serial.println("°C");
+            Serial.println("========================================");
+        }
+        return;
+    }
+    
+    // Existing commands
     if (cmd == "ON") {
         stopMotor();
         currentState = 0;
-        Serial.println("Command: ON -> motor stopped.");
+        Serial.println("Command: ON -> motor stopped, auto mode enabled.");
     } else if (cmd == "OFF") {
         stopMotor();
+        currentState = 0;
         Serial.println("Command: OFF -> motor stopped.");
     } else if (cmd == "COLD") {
         stopMotor();
@@ -248,8 +346,16 @@ void handleCommand(const std::string& cmd) {
         // Send current temp
         int sensorValue = analogRead(ANALOG_PIN);
         float tempC = analogToTemp(sensorValue);
-        char buf[16]; snprintf(buf, sizeof(buf), "%.1f", tempC);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%.1f", tempC);
         pTxCharacteristic->setValue(buf);
         pTxCharacteristic->notify();
+        
+        Serial.print("Sent temperature to app: ");
+        Serial.print(tempC, 1);
+        Serial.println("°C");
+    } else {
+        Serial.print("Unknown command received: ");
+        Serial.println(cmd.c_str());
     }
 }
