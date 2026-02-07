@@ -19,17 +19,21 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AcUnit
-import androidx.compose.material.icons.filled.PowerSettingsNew
-import androidx.compose.material.icons.filled.Thermostat
-import androidx.compose.material.icons.filled.Whatshot
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.example.diddy_niel.ui.theme.DiddynielTheme
 import kotlin.concurrent.thread
@@ -97,14 +101,19 @@ class MainActivity : ComponentActivity() {
                     ThermostatScreen(
                         modifier = Modifier.padding(padding),
                         statusText = if (DEBUG_MODE) (if (mockIsOn) "%.1f".format(mockTemperature) else "OFF") else bluetoothData,
-                        onSetHot = { if (DEBUG_MODE) mockTemperature = 45.0 else thread { bluetooth?.send("HOT") } },
-                        onSetCold = { if (DEBUG_MODE) mockTemperature = 18.0 else thread { bluetooth?.send("COLD") } },
+                        onSetHotLimit = { limit -> 
+                            if (DEBUG_MODE) mockTemperature = limit.toDoubleOrNull() ?: 45.0 
+                            else thread { bluetooth?.send("SETHOT $limit") } 
+                        },
+                        onSetColdLimit = { limit -> 
+                            if (DEBUG_MODE) mockTemperature = limit.toDoubleOrNull() ?: 18.0 
+                            else thread { bluetooth?.send("SETCOLD $limit") } 
+                        },
                         onTurnOn = { if (DEBUG_MODE) mockIsOn = true else thread { bluetooth?.send("ON") } },
                         onTurnOff = { if (DEBUG_MODE) mockIsOn = false else thread { bluetooth?.send("OFF") } },
                         onRefresh = {
                             if (DEBUG_MODE) mockTemperature += (Math.random() - 0.5)
                             else {
-                                // If stuck in Connecting or Searching, allow a manual retry
                                 val isNotConnected = bluetooth == null || 
                                                      bluetoothData == "Disconnected" || 
                                                      bluetoothData == "Ready to Connect" ||
@@ -218,7 +227,7 @@ class MainActivity : ComponentActivity() {
     private fun connectToDevice(device: android.bluetooth.BluetoothDevice) {
         bluetooth?.close()
         cancelConnectionTimeout()
-        Thread.sleep(1000)
+        
         val bt = BluetoothNiNiel(this, device)
         bt.onConnectionFailed = {
             Log.w("MainActivity", "Direct connection failed. Clearing cache.")
@@ -264,12 +273,17 @@ class MainActivity : ComponentActivity() {
 fun ThermostatScreen(
     modifier: Modifier = Modifier,
     statusText: String,
-    onSetHot: () -> Unit,
-    onSetCold: () -> Unit,
+    onSetHotLimit: (String) -> Unit,
+    onSetColdLimit: (String) -> Unit,
     onTurnOn: () -> Unit,
     onTurnOff: () -> Unit,
     onRefresh: () -> Unit
 ) {
+    var showHotDialog by remember { mutableStateOf(false) }
+    var showColdDialog by remember { mutableStateOf(false) }
+    var tempLimitInput by remember { mutableStateOf("") }
+    var isInputError by remember { mutableStateOf(false) }
+
     val currentTemp = remember(statusText) {
         statusText.filter { it.isDigit() || it == '.' }.toDoubleOrNull()
     }
@@ -280,6 +294,78 @@ fun ThermostatScreen(
                !statusText.contains("No Device", ignoreCase = true) && 
                !statusText.contains("Ready to Connect", ignoreCase = true) && 
                !statusText.contains("Connecting", ignoreCase = true)
+
+    if (showHotDialog) {
+        val hotTemp = tempLimitInput.toDoubleOrNull()
+        isInputError = hotTemp != null && hotTemp > 65.0
+
+        AlertDialog(
+            onDismissRequest = { showHotDialog = false },
+            title = { Text("Set Hot Temp Limit") },
+            text = {
+                OutlinedTextField(
+                    value = tempLimitInput,
+                    onValueChange = { tempLimitInput = it },
+                    label = { Text("Temperature (°C)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                    isError = isInputError,
+                    supportingText = { if (isInputError) Text("Max temperature is 65°C") }
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (!isInputError) {
+                            onSetHotLimit(tempLimitInput)
+                            showHotDialog = false
+                            tempLimitInput = ""
+                        }
+                    },
+                    enabled = tempLimitInput.isNotEmpty() && !isInputError
+                ) { Text("Set") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showHotDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    if (showColdDialog) {
+        val coldTemp = tempLimitInput.toDoubleOrNull()
+        isInputError = coldTemp != null && coldTemp < 18.0
+
+        AlertDialog(
+            onDismissRequest = { showColdDialog = false },
+            title = { Text("Set Cold Temp Limit") },
+            text = {
+                OutlinedTextField(
+                    value = tempLimitInput,
+                    onValueChange = { tempLimitInput = it },
+                    label = { Text("Temperature (°C)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                    isError = isInputError,
+                    supportingText = { if (isInputError) Text("Min temperature is 18°C") }
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (!isInputError) {
+                            onSetColdLimit(tempLimitInput)
+                            showColdDialog = false
+                            tempLimitInput = ""
+                        }
+                    },
+                    enabled = tempLimitInput.isNotEmpty() && !isInputError
+                ) { Text("Set") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showColdDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
 
     Column(
         modifier = modifier.fillMaxSize(),
@@ -312,47 +398,90 @@ fun ThermostatScreen(
         
         Row(
             modifier = Modifier.padding(8.dp),
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
+            horizontalArrangement = Arrangement.spacedBy(24.dp)
         ) {
-            Button(
-                onClick = onTurnOff,
+            ControlIconButton(
+                icon = Icons.Default.Block, // Changed to Block for OFF
+                color = if (isOn) Color.DarkGray else Color.LightGray,
                 enabled = isOn,
-                colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)
-            ) { Text("OFF") }
+                onClick = onTurnOff
+            )
 
-            Button(
-                onClick = onTurnOn,
+            ControlIconButton(
+                icon = Icons.Default.PlayArrow,
+                color = if (!isOn) Color(0xFF4CAF50) else Color.LightGray,
                 enabled = !isOn,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
-            ) { Text("ON") }
+                onClick = onTurnOn
+            )
         }
 
         Row(
             modifier = Modifier.padding(8.dp),
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
+            horizontalArrangement = Arrangement.spacedBy(24.dp)
         ) {
-            Button(
-                onClick = onSetCold,
+            ControlIconButton(
+                icon = Icons.Default.AcUnit,
+                color = Color(0xFF03A9F4),
                 enabled = isOn,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF03A9F4))
-            ) { Text("COLD") }
+                onClick = { 
+                    tempLimitInput = ""
+                    showColdDialog = true 
+                }
+            )
             
-            Button(
-                onClick = onSetHot,
+            ControlIconButton(
+                icon = Icons.Default.Whatshot,
+                color = Color(0xFFFF5722),
                 enabled = isOn,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5722))
-            ) { Text("HOT") }
+                onClick = { 
+                    tempLimitInput = ""
+                    showHotDialog = true 
+                }
+            )
         }
         
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(24.dp))
 
-        Button(onClick = onRefresh) {
+        IconButton(
+            onClick = onRefresh,
+            modifier = Modifier
+                .size(64.dp)
+                .background(MaterialTheme.colorScheme.primaryContainer, CircleShape)
+        ) {
             val isActionConnect = statusText == "Ready to Connect" || 
                                  statusText == "Disconnected" || 
                                  statusText == "Searching..." ||
                                  statusText == "Connecting..."
             
-            Text(if (isActionConnect) "Connect" else "Refresh")
+            Icon(
+                imageVector = if (isActionConnect) Icons.Default.BluetoothConnected else Icons.Default.Refresh,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onPrimaryContainer
+            )
         }
+    }
+}
+
+@Composable
+fun ControlIconButton(
+    icon: ImageVector,
+    color: Color,
+    enabled: Boolean,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .size(72.dp)
+            .clip(CircleShape)
+            .background(if (enabled) color.copy(alpha = 0.15f) else Color.Transparent)
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            modifier = Modifier.size(40.dp),
+            tint = if (enabled) color else Color.LightGray
+        )
     }
 }
