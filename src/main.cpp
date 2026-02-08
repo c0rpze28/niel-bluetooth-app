@@ -70,6 +70,10 @@ void saveTemperatureLimits();
 void setup() {
     Serial.begin(115200);
 
+    // POWER SAVING: Reduce CPU frequency from 160MHz to 80MHz
+    setCpuFrequencyMhz(80);
+    Serial.println("CPU frequency set to 80MHz for power saving");
+
     pinMode(IN1, OUTPUT);
     pinMode(IN2, OUTPUT);
 
@@ -201,7 +205,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         
         delay(500);
         NimBLEDevice::startAdvertising();
-        Serial.println("Advertising restarted");
+        Serial.println("Advertising restarted - ready for reconnection");
     }
     
     uint32_t onPassKeyRequest() {
@@ -219,11 +223,21 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
 void setupBLE() {
     NimBLEDevice::init("ESP32-C3-NUS");
+    
+    // POWER SAVING: Reduce BLE transmit power
+    // Options: ESP_PWR_LVL_N12, N9, N6, N3, N0, P3, P6, P9
+    // N0 = 0dBm (good balance of range and power)
+    // Default is P9 = +9dBm (maximum power, more heat)
+    NimBLEDevice::setPower(ESP_PWR_LVL_N0);
+    Serial.println("BLE power set to 0dBm for reduced heat");
+    
     NimBLEDevice::deleteAllBonds();
     NimBLEDevice::setSecurityAuth(false, false, true);
+    
     pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(new ServerCallbacks());
     pServer->advertiseOnDisconnect(true);
+    
     NimBLEService* pService = pServer->createService(NUS_SERVICE_UUID);
 
     // RX characteristic (WRITE)
