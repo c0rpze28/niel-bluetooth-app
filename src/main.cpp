@@ -29,11 +29,11 @@ int currentState = 0;
 float desiredCold = 20.0;
 float desiredHot  = 50.0;
 
-// Sensor calibration
+// Sensor calibration - UPDATED TO MATCH YOUR ORIGINAL VALUES
 #define TEMP_MIN 15.0
 #define TEMP_MAX 60.0
-#define ANALOG_MIN 1965
-#define ANALOG_MAX 1470
+#define ANALOG_MIN 2930  // Cold reading (15°C)
+#define ANALOG_MAX 1870  // Hot reading (60°C)
 
 // Temperature limits
 #define MIN_COLD_LIMIT 18.0
@@ -92,15 +92,34 @@ void setup() {
 // Main loop
 // -----------------------------
 void loop() {
+    // Read main sensor for motor logic (ANALOG_PIN 0)
     int sensorValue = analogRead(ANALOG_PIN);
+    
+    // Read second sensor for monitoring only (ANALOG_PIN2 2)
     int sensorValue2 = analogRead(ANALOG_PIN2);
+    
+    // Convert main sensor to temperature for motor control
     float tempC = analogToTemp(sensorValue);
+    
+    // Convert second sensor to temperature for display
+    int tempReading2 = map(sensorValue2, 2930, 1870, 15, 60);
 
-    // Debug
-    Serial.print("Temp: "); Serial.print(tempC, 1); Serial.print("°C | Analog0: ");
-    Serial.print(sensorValue); Serial.print(" | Analog2: "); Serial.println(sensorValue2);
-    Serial.print("Limits - Cold: "); Serial.print(desiredCold, 1); 
-    Serial.print("°C | Hot: "); Serial.print(desiredHot, 1); Serial.println("°C");
+    // Debug - print both sensors
+    Serial.print("Analog0 (motor): ");
+    Serial.print(sensorValue);
+    Serial.print(" | Temp0: ");
+    Serial.print(tempC, 1);
+    Serial.print("°C | Analog2 (monitor): ");
+    Serial.print(sensorValue2);
+    Serial.print(" | Temp2: ");
+    Serial.print(tempReading2);
+    Serial.println("°C");
+    
+    Serial.print("Limits - Cold: "); 
+    Serial.print(desiredCold, 1); 
+    Serial.print("°C | Hot: "); 
+    Serial.print(desiredHot, 1); 
+    Serial.println("°C");
 
     // Motor control based on temperature
     if (tempC < desiredCold && currentState != 1) {
@@ -134,7 +153,10 @@ void rampUpPWM(const char* stateName) {
     delay(2000);
     for (int duty = 0; duty <= MAX_DUTY; duty++) {
         ledcWrite(PWM_CHANNEL, duty);
-        Serial.print("State: "); Serial.print(stateName); Serial.print(" | PWM: "); Serial.println(duty);
+        Serial.print("State: "); 
+        Serial.print(stateName); 
+        Serial.print(" | PWM: "); 
+        Serial.println(duty);
         delay(15000 / MAX_DUTY);
     }
     ledcWrite(PWM_CHANNEL, MAX_DUTY);
@@ -152,6 +174,8 @@ void stopMotor() {
 // Temperature mapping
 // -----------------------------
 float analogToTemp(int sensorValue) {
+    // Constrain to valid range, then map to temperature
+    // Higher analog value = colder temperature (NTC thermistor behavior)
     sensorValue = constrain(sensorValue, ANALOG_MAX, ANALOG_MIN);
     return map(sensorValue, ANALOG_MIN, ANALOG_MAX, TEMP_MIN, TEMP_MAX);
 }
@@ -225,9 +249,6 @@ void setupBLE() {
     NimBLEDevice::init("ESP32-C3-NUS");
     
     // POWER SAVING: Reduce BLE transmit power
-    // Options: ESP_PWR_LVL_N12, N9, N6, N3, N0, P3, P6, P9
-    // N0 = 0dBm (good balance of range and power)
-    // Default is P9 = +9dBm (maximum power, more heat)
     NimBLEDevice::setPower(ESP_PWR_LVL_N0);
     Serial.println("BLE power set to 0dBm for reduced heat");
     
@@ -357,7 +378,7 @@ void handleCommand(const std::string& cmd) {
         currentState = 2;
         Serial.println("Command: HOT -> motor running CCW.");
     } else if (cmd == "GET") {
-        // Send current temp
+        // Send current temp from main sensor
         int sensorValue = analogRead(ANALOG_PIN);
         float tempC = analogToTemp(sensorValue);
         char buf[16];
