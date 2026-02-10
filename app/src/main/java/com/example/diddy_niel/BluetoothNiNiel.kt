@@ -14,7 +14,7 @@ class BluetoothNiNiel(private val context: Context, private val device: Bluetoot
 
     private var bluetoothGatt: BluetoothGatt? = null
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
-    
+
     private val _receivedData = MutableStateFlow("Connecting...")
     val receivedData: StateFlow<String> = _receivedData.asStateFlow()
 
@@ -40,10 +40,7 @@ class BluetoothNiNiel(private val context: Context, private val device: Bluetoot
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.d(TAG, "Disconnected. Status: $status")
                 _receivedData.value = "Disconnected"
-
-                // NOW close the gatt properly
-                gatt.close()  // ADD THIS LINE
-
+                gatt.close()
                 if (status != BluetoothGatt.GATT_SUCCESS) onConnectionFailed?.invoke()
             }
         }
@@ -54,6 +51,9 @@ class BluetoothNiNiel(private val context: Context, private val device: Bluetoot
                 val service = gatt.getService(SERVICE_UUID)
                 writeCharacteristic = service?.getCharacteristic(RX_WRITE_UUID)
                 val readChar = service?.getCharacteristic(TX_READ_UUID)
+
+                Log.d(TAG, "Write char: ${writeCharacteristic != null}, Read char: ${readChar != null}")
+
                 if (readChar != null) {
                     gatt.setCharacteristicNotification(readChar, true)
                     val descriptor = readChar.getDescriptor(CCCD_UUID)
@@ -61,10 +61,11 @@ class BluetoothNiNiel(private val context: Context, private val device: Bluetoot
                         it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                         gatt.writeDescriptor(it)
                     }
-                    gatt.requestMtu(517) // Request MTU after service discovery
+                    gatt.requestMtu(517)
                 }
             } else {
-                 _receivedData.value = "Discovery Failed"
+                _receivedData.value = "Discovery Failed"
+                Log.e(TAG, "Service discovery failed with status: $status")
             }
         }
 
@@ -73,24 +74,29 @@ class BluetoothNiNiel(private val context: Context, private val device: Bluetoot
                 Log.d(TAG, "Handshake Complete. Ready.")
                 _receivedData.value = "Ready"
                 thread {
-                    Thread.sleep(500) // Wait for ESP32 to be ready
+                    Thread.sleep(500)
                     send("GET")
                 }
             }
         }
-        
+
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             if (characteristic.uuid == TX_READ_UUID) {
                 val bytes = characteristic.value ?: return
                 val cleanValue = bytes.takeWhile { it.toInt() != 0 }.map { it.toInt().toChar() }.joinToString("").trim()
                 if (cleanValue.isNotEmpty()) {
+                    Log.d(TAG, "Received from ESP32: '$cleanValue'")
                     _receivedData.value = cleanValue
                 }
             }
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) Log.e(TAG, "Write failed with status: $status")
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "Write successful: ${String(characteristic.value)}")
+            } else {
+                Log.e(TAG, "Write failed with status: $status")
+            }
         }
     }
 
@@ -98,21 +104,33 @@ class BluetoothNiNiel(private val context: Context, private val device: Bluetoot
     fun connect() {
         _receivedData.value = "Connecting..."
         thread {
-            Thread.sleep(500) // CRITICAL: Wait for old connection to die
+            Thread.sleep(500)
             bluetoothGatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         }
     }
 
     @SuppressLint("MissingPermission")
     fun send(command: String) {
-        val gatt = bluetoothGatt ?: return
-        val char = writeCharacteristic ?: return
-        
-        // Your ESP32 code expects a raw string, not one with a newline
-        char.value = command.toByteArray()
+        val gatt = bluetoothGatt
+        val char = writeCharacteristic
+
+        if (gatt == null) {
+            Log.e(TAG, "Cannot send '$command' - GATT is null")
+            return
+        }
+
+        if (char == null) {
+            Log.e(TAG, "Cannot send '$command' - Write characteristic is null")
+            return
+        }
+
+        Log.d(TAG, "Sending command: '$command'")
+
+        char.value = command.toByteArray(Charsets.UTF_8)
         char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        
-        gatt.writeCharacteristic(char)
+
+        val success = gatt.writeCharacteristic(char)
+        Log.d(TAG, "Write initiated: $success for command '$command'")
     }
 
     @SuppressLint("MissingPermission")
