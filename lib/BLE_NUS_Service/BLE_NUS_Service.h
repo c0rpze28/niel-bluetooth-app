@@ -50,11 +50,12 @@ private:
     bool connected = false;
     uint32_t securityPassKey;
     
-    // Internal callback classes
+    // Internal callback classes - NO override keywords
     class RxCallbacks : public NimBLECharacteristicCallbacks {
     public:
         RxCallbacks(BLE_NUS_Service* service) : parent(service) {}
-        void onWrite(NimBLECharacteristic* pCharacteristic) override;
+        void onWrite(NimBLECharacteristic* pCharacteristic);
+        void onWrite(NimBLECharacteristic* pCharacteristic, const uint8_t* data, size_t len);
     private:
         BLE_NUS_Service* parent;
     };
@@ -62,10 +63,12 @@ private:
     class ServerCallbacks : public NimBLEServerCallbacks {
     public:
         ServerCallbacks(BLE_NUS_Service* service) : parent(service) {}
-        void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override;
-        void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override;
-        uint32_t onPassKeyRequest() override;
-        void onAuthenticationComplete(NimBLEConnInfo& connInfo) override;
+        void onConnect(NimBLEServer* pServer);
+        void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc);
+        void onDisconnect(NimBLEServer* pServer);
+        void onDisconnect(NimBLEServer* pServer, ble_gap_conn_desc* desc, int reason);
+        uint32_t onPassKeyRequest();
+        void onAuthenticationComplete(ble_gap_conn_desc* desc);
     private:
         BLE_NUS_Service* parent;
     };

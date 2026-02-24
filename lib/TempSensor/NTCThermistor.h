@@ -34,3 +34,5 @@ private:
     
     float mapValue(int value);
 };
+
+#endif

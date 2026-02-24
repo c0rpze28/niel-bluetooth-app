@@ -37,3 +37,5 @@ private:
     uint8_t currentDuty;
     bool initialized;
 };
+
+#endif

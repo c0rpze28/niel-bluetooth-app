@@ -18,12 +18,12 @@ void BLE_NUS_Service::begin(const char* deviceName,
     // Initialize NimBLE
     NimBLEDevice::init(deviceName);
     
-    // Power saving mode (adjust based on your needs)
-    NimBLEDevice::setPower(ESP_PWR_LVL_N0); // Lowest power
+    // Power saving mode
+    NimBLEDevice::setPower(ESP_PWR_LVL_N0);
     
     if (enableEncryption) {
         NimBLEDevice::deleteAllBonds();
-        NimBLEDevice::setSecurityAuth(false, false, true); // Bonding, MITM, Secure connections
+        NimBLEDevice::setSecurityAuth(false, false, true);
     }
     
     // Create server
@@ -35,23 +35,32 @@ void BLE_NUS_Service::begin(const char* deviceName,
     NimBLEService* pService = pServer->createService(NUS_SERVICE_UUID);
     
     // RX Characteristic (Write)
+    uint32_t rxProperties = NIMBLE_PROPERTY::WRITE;
+    if (enableEncryption) {
+        rxProperties |= NIMBLE_PROPERTY::WRITE_ENC;
+    }
     pRxCharacteristic = pService->createCharacteristic(
         NUS_RX_CHAR_UUID,
-        NIMBLE_PROPERTY::WRITE |
-        (enableEncryption ? NIMBLE_PROPERTY::WRITE_ENC : 0));
+        rxProperties);
     
     if (commandCallback) {
         pRxCharacteristic->setCallbacks(new RxCallbacks(this));
     }
     
-    // TX Characteristic (Notify)
+    // TX Characteristic (Notify) - NOTIFY_ENC might not exist
+    uint32_t txProperties = NIMBLE_PROPERTY::NOTIFY;
+    // Skip NOTIFY_ENC if it doesn't exist
     pTxCharacteristic = pService->createCharacteristic(
         NUS_TX_CHAR_UUID,
-        NIMBLE_PROPERTY::NOTIFY |
-        (enableEncryption ? NIMBLE_PROPERTY::NOTIFY_ENC : 0));
+        txProperties);
     
-    // Add CCCD descriptor for notifications
-    NimBLEDescriptor* cccd = new NimBLEDescriptor("2902", 0, 2, pTxCharacteristic);
+    // Add CCCD descriptor for notifications - using the 4-parameter constructor
+    NimBLEDescriptor* cccd = new NimBLEDescriptor(
+        NimBLEUUID((uint16_t)0x2902),
+        0,  // properties
+        2,  // max length
+        pTxCharacteristic
+    );
     uint8_t cccd_value[2] = { 0x00, 0x00 };
     cccd->setValue(cccd_value, 2);
     pTxCharacteristic->addDescriptor(cccd);
@@ -59,15 +68,13 @@ void BLE_NUS_Service::begin(const char* deviceName,
     // Start service
     pService->start();
     
-    // Setup advertising
+    // Setup advertising - use setScanResponseData instead of setScanResponse
     NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(NUS_SERVICE_UUID);
-    pAdvertising->setScanResponse(true);
-    pAdvertising->setMinInterval(32); // 20ms
-    pAdvertising->setMaxInterval(64); // 40ms
+    // pAdvertising->setScanResponse(true); // Comment out if not available
     
     // Start advertising
-    NimBLEDevice::startAdvertising();
+    pAdvertising->start();
     
     initialized = true;
     
@@ -126,7 +133,7 @@ int BLE_NUS_Service::getConnectedCount() {
 // Start advertising
 void BLE_NUS_Service::startAdvertising() {
     if (!initialized) return;
-    NimBLEDevice::startAdvertising();
+    NimBLEDevice::getAdvertising()->start();
 }
 
 // Stop advertising
@@ -139,13 +146,14 @@ void BLE_NUS_Service::stopAdvertising() {
 void BLE_NUS_Service::end() {
     if (!initialized) return;
     
-    // Disconnect all clients
+    // disconnectAll might not exist, use disconnect on each connection
     if (pServer) {
-        pServer->disconnectAll();
+        // Get connected count and disconnect each
+        int count = pServer->getConnectedCount();
+        for (int i = 0; i < count; i++) {
+            pServer->disconnect(i);
+        }
     }
-    
-    // Deinit NimBLE
-    NimBLEDevice::deinit();
     
     initialized = false;
     connected = false;
@@ -161,24 +169,38 @@ void BLE_NUS_Service::RxCallbacks::onWrite(NimBLECharacteristic* pCharacteristic
     }
 }
 
-void BLE_NUS_Service::ServerCallbacks::onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
+void BLE_NUS_Service::RxCallbacks::onWrite(NimBLECharacteristic* pCharacteristic, const uint8_t* data, size_t len) {
+    std::string value(reinterpret_cast<const char*>(data), len);
+    
+    if (!value.empty() && parent->commandCallback) {
+        parent->commandCallback(value);
+    }
+}
+
+void BLE_NUS_Service::ServerCallbacks::onConnect(NimBLEServer* pServer) {
     parent->connected = true;
     Serial.println("BLE Client connected");
-    
-    // Stop advertising while connected
     NimBLEDevice::getAdvertising()->stop();
 }
 
-void BLE_NUS_Service::ServerCallbacks::onDisconnect(NimBLEServer* pServer, 
-                                                     NimBLEConnInfo& connInfo, 
-                                                     int reason) {
+void BLE_NUS_Service::ServerCallbacks::onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
+    parent->connected = true;
+    Serial.println("BLE Client connected");
+    NimBLEDevice::getAdvertising()->stop();
+}
+
+void BLE_NUS_Service::ServerCallbacks::onDisconnect(NimBLEServer* pServer) {
     parent->connected = false;
-    Serial.print("BLE Client disconnected. Reason: ");
-    Serial.println(reason);
-    
-    // Restart advertising after disconnection
+    Serial.println("BLE Client disconnected");
     delay(500);
-    NimBLEDevice::startAdvertising();
+    NimBLEDevice::getAdvertising()->start();
+}
+
+void BLE_NUS_Service::ServerCallbacks::onDisconnect(NimBLEServer* pServer, ble_gap_conn_desc* desc, int reason) {
+    parent->connected = false;
+    Serial.println("BLE Client disconnected");
+    delay(500);
+    NimBLEDevice::getAdvertising()->start();
 }
 
 uint32_t BLE_NUS_Service::ServerCallbacks::onPassKeyRequest() {
@@ -187,10 +209,10 @@ uint32_t BLE_NUS_Service::ServerCallbacks::onPassKeyRequest() {
     return parent->securityPassKey;
 }
 
-void BLE_NUS_Service::ServerCallbacks::onAuthenticationComplete(NimBLEConnInfo& connInfo) {
-    if (!connInfo.isEncrypted()) {
+void BLE_NUS_Service::ServerCallbacks::onAuthenticationComplete(ble_gap_conn_desc* desc) {
+    if (!desc->sec_state.encrypted) {
         Serial.println("Encryption failed - disconnecting");
-        parent->pServer->disconnect(connInfo.getConnHandle());
+        parent->pServer->disconnect(desc->conn_handle);
         parent->connected = false;
     } else {
         Serial.println("Authentication successful");

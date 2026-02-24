@@ -43,3 +43,5 @@ private:
     std::function<void()> clickCallback;
     std::function<void()> longPressCallback;
 };
+
+#endif

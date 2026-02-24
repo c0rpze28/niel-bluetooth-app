@@ -18,6 +18,14 @@
 #define SDA_PIN 4
 #define SCL_PIN 3
 
+// Add display dimensions if not defined elsewhere
+#ifndef SCREEN_WIDTH
+#define SCREEN_WIDTH 128
+#endif
+#ifndef SCREEN_HEIGHT
+#define SCREEN_HEIGHT 32
+#endif
+
 // ---------------- GLOBAL OBJECTS ----------------
 TouchButton touchButton(TOUCH_PIN);
 NTCThermistor thermistor(NTC_PIN);
@@ -42,6 +50,174 @@ void saveLimits();
 void handleBLECommand(const std::string& cmd);
 void onStateChange(ThermostatStateMachine::State oldState, 
                    ThermostatStateMachine::State newState);
+
+// ========== HELPER FUNCTIONS ==========
+
+// State name helper function
+const char* getStateName(ThermostatStateMachine::State state) {
+    switch (state) {
+        case ThermostatStateMachine::STATE_STANDBY:
+            return "STANDBY";
+        case ThermostatStateMachine::STATE_COLD_RAMP:
+            return "COLD_RAMP";
+        case ThermostatStateMachine::STATE_COLD_MAINTAIN:
+            return "COLD_MAINTAIN";
+        case ThermostatStateMachine::STATE_HOT_RAMP:
+            return "HOT_RAMP";
+        case ThermostatStateMachine::STATE_HOT_MAINTAIN:
+            return "HOT_MAINTAIN";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+// ========== IMPLEMENTATIONS ==========
+
+void handleBLECommand(const std::string& cmd) {
+    Serial.print("BLE Command received: ");
+    Serial.println(cmd.c_str());
+
+    // Parse temperature reading commands
+    if (cmd == "GET" || cmd == "GET_TEMP") {
+        float temp = thermistor.readCelsius();
+        char buffer[16];
+        snprintf(buffer, sizeof(buffer), "%.1f", temp);
+        bleService.sendData(buffer);
+    }
+    
+    // Set hot limit (format: "SETHOT 50.0" or "SET_HOT_LIMIT 50.0")
+    else if (cmd.rfind("SETHOT ", 0) == 0 || cmd.rfind("SET_HOT_LIMIT ", 0) == 0) {
+        float newLimit = atof(cmd.substr(cmd.find(' ') + 1).c_str());
+        if (newLimit >= 30 && newLimit <= 70) {
+            hotLimit = newLimit;
+            saveLimits();
+            tempController.setHeatingLimits(hotLimit);
+            bleService.sendData("HOT_LIMIT_OK");
+        } else {
+            bleService.sendData("ERROR: Invalid range (30-70)");
+        }
+    }
+    
+    // Set cold limit (format: "SETCOLD 15.0" or "SET_COLD_LIMIT 15.0")
+    else if (cmd.rfind("SETCOLD ", 0) == 0 || cmd.rfind("SET_COLD_LIMIT ", 0) == 0) {
+        float newLimit = atof(cmd.substr(cmd.find(' ') + 1).c_str());
+        if (newLimit >= 0 && newLimit <= 30) {
+            coldLimit = newLimit;
+            saveLimits();
+            tempController.setCoolingLimits(coldLimit);
+            bleService.sendData("COLD_LIMIT_OK");
+        } else if (cmd == "GET_STATUS") {
+            float temp = thermistor.readCelsius();
+            char buffer[64];
+            snprintf(buffer, sizeof(buffer), 
+            "T:%.1f,M:%s,S:%s,C:%.1f,H:%.1f",
+            temp,
+            (tempController.getMode() == TemperatureController::HEATING) ? "H" :
+            (tempController.getMode() == TemperatureController::COOLING) ? "C" : "S",
+            getStateName(stateMachine.getState()),
+            coldLimit,
+            hotLimit);
+            bleService.sendData(buffer);
+        } else {
+            bleService.sendData("ERROR: Invalid range (0-30)");
+        }
+    }
+    
+    // Mode switching commands
+    else if (cmd == "SET_STANDBY" || cmd == "STANDBY") {
+        stateMachine.requestStandby();
+        bleService.sendData("MODE:STANDBY");
+    }
+    else if (cmd == "SET_COLD" || cmd == "COLD") {
+        stateMachine.requestCold();
+        bleService.sendData("MODE:COLD");
+    }
+    else if (cmd == "SET_HOT" || cmd == "HOT") {
+        stateMachine.requestHot();
+        bleService.sendData("MODE:HOT");
+    }
+    
+    // Status requests
+    else if (cmd == "GET_STATUS") {
+        float temp = thermistor.readCelsius();
+        char buffer[64];
+        snprintf(buffer, sizeof(buffer), 
+                 "T:%.1f,M:%s,S:%s,C:%.1f,H:%.1f",
+                 temp,
+                 (tempController.getMode() == TemperatureController::HEATING) ? "H" :
+                 (tempController.getMode() == TemperatureController::COOLING) ? "C" : "S",
+                 getStateName(stateMachine.getState()),  // Use helper function
+                 coldLimit,
+                 hotLimit);
+        bleService.sendData(buffer);
+    }
+    
+    // Get current limits
+    else if (cmd == "GET_LIMITS") {
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "COLD:%.1f,HOT:%.1f", coldLimit, hotLimit);
+        bleService.sendData(buffer);
+    }
+    
+    // Get current mode
+    else if (cmd == "GET_MODE") {
+        const char* modeStr = (tempController.getMode() == TemperatureController::HEATING) ? "HOT" :
+                              (tempController.getMode() == TemperatureController::COOLING) ? "COLD" : "STANDBY";
+        bleService.sendData(modeStr);
+    }
+    
+    // Help command
+    else if (cmd == "HELP") {
+        bleService.sendData("Commands: GET, SETHOT [30-70], SETCOLD [0-30], SET_STANDBY, SET_HOT, SET_COLD, GET_STATUS, GET_LIMITS, GET_MODE");
+    }
+    
+    // Unknown command
+    else {
+        bleService.sendData("UNKNOWN");
+    }
+}
+
+// ONLY ONE definition of onStateChange - this is the CORRECT one
+void onStateChange(ThermostatStateMachine::State oldState, 
+                   ThermostatStateMachine::State newState) {
+    Serial.printf("State change: %s -> %s\n", 
+                  getStateName(oldState),
+                  getStateName(newState));
+    
+    if (bleService.isConnected()) {
+        bleService.sendData(getStateName(newState));
+    }
+}
+
+void setupPins() {
+    pinMode(AIN1_PIN, OUTPUT);
+    pinMode(AIN2_PIN, OUTPUT);
+    pinMode(STBY_PIN, OUTPUT);
+    
+    digitalWrite(STBY_PIN, LOW);
+}
+
+void setupTemperatureSensor() {
+    thermistor.setADCResolution(4095);
+    thermistor.setCalibration(1870, 5.0, 3400, 66.0);
+}
+
+void loadLimits() {
+    preferences.begin("thermostat", false);
+    coldLimit = preferences.getFloat("coldLimit", 15.0);
+    hotLimit = preferences.getFloat("hotLimit", 50.0);
+    preferences.end();
+    
+    tempController.setHeatingLimits(hotLimit);
+    tempController.setCoolingLimits(coldLimit);
+}
+
+void saveLimits() {
+    preferences.begin("thermostat", false);
+    preferences.putFloat("coldLimit", coldLimit);
+    preferences.putFloat("hotLimit", hotLimit);
+    preferences.end();
+}
 
 // ---------------- SETUP ----------------
 void setup() {
@@ -121,18 +297,9 @@ void loop() {
     // Update temperature controller
     auto controllerMode = tempController.update(temperature);
     
-    // Control output based on controller recommendation
-    if (stateMachine.getState() != ThermostatStateMachine::STATE_STANDBY) {
-        if (controllerMode == TemperatureController::HEATING || 
-            controllerMode == TemperatureController::COOLING) {
-            // PWM is already handling the output via ramping
-            // Just ensure direction is correct
-        }
-    }
-    
     // Update display
     display.showTemperatureMode(temperature, 
-                                controllerMode,
+                                static_cast<int>(controllerMode),
                                 tempController.getTargetTemperature(),
                                 tempController.isOutputActive());
     
@@ -152,56 +319,10 @@ void loop() {
                      temperature,
                      (controllerMode == TemperatureController::STANDBY) ? "STBY" :
                      (controllerMode == TemperatureController::HEATING) ? "HEAT" : "COOL",
-                     stateMachine.getStateName(),
+                     getStateName(stateMachine.getState()),  // Use helper function
                      bleService.isConnected() ? "CONN" : "DISCONN");
         lastDebugTime = millis();
     }
     
     delay(100);
-}
-
-// ---------------- IMPLEMENTATIONS ----------------
-void setupPins() {
-    pinMode(AIN1_PIN, OUTPUT);
-    pinMode(AIN2_PIN, OUTPUT);
-    pinMode(STBY_PIN, OUTPUT);
-    
-    digitalWrite(STBY_PIN, LOW);
-}
-
-void setupTemperatureSensor() {
-    thermistor.setADCResolution(4095);
-    thermistor.setCalibration(1870, 5.0, 3400, 66.0);
-}
-
-void loadLimits() {
-    preferences.begin("thermostat", false);
-    coldLimit = preferences.getFloat("coldLimit", 15.0);
-    hotLimit = preferences.getFloat("hotLimit", 50.0);
-    preferences.end();
-    
-    tempController.setHeatingLimits(hotLimit);
-    tempController.setCoolingLimits(coldLimit);
-}
-
-void saveLimits() {
-    preferences.begin("thermostat", false);
-    preferences.putFloat("coldLimit", coldLimit);
-    preferences.putFloat("hotLimit", hotLimit);
-    preferences.end();
-}
-
-void handleBLECommand(const std::string& cmd) {
-    // Similar command handling as before...
-}
-
-void onStateChange(ThermostatStateMachine::State oldState, 
-                   ThermostatStateMachine::State newState) {
-    Serial.printf("State change: %s -> %s\n", 
-                  stateMachine.getStateName(),
-                  stateMachine.getStateName());
-    
-    if (bleService.isConnected()) {
-        bleService.sendData(stateMachine.getStateName());
-    }
 }

@@ -48,3 +48,5 @@ private:
     
     void transitionTo(State newState);
 };
+
+#endif

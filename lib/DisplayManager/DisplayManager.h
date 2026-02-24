@@ -4,6 +4,9 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+// Forward declaration to avoid circular dependency
+class TemperatureController;
+
 class DisplayManager {
 public:
     DisplayManager(uint8_t width, uint8_t height, TwoWire* wire = &Wire);
@@ -13,7 +16,7 @@ public:
     
     // Update methods for your specific application
     void showTemperatureMode(float temperature, 
-                            TemperatureController::Mode mode,
+                            int mode,  // Use int instead of TemperatureController::Mode
                             float targetTemp,
                             bool outputActive);
     
@@ -32,3 +35,5 @@ private:
     void drawHeader(const char* title);
     void clearArea(uint8_t x, uint8_t y, uint8_t w, uint8_t h);
 };
+
+#endif

@@ -39,3 +39,5 @@ private:
     void updateHeating(float temp);
     void updateCooling(float temp);
 };
+
+#endif
