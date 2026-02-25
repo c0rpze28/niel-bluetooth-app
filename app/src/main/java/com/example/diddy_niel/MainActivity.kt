@@ -1,51 +1,31 @@
 package com.example.diddy_niel
 
 import android.Manifest
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothManager
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
-import android.content.Context
-import android.content.SharedPreferences
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.os.ParcelUuid
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
+import androidx.activity.viewModels
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.dp
 import com.example.diddy_niel.ui.theme.DiddynielTheme
-import kotlin.concurrent.thread
 
 class MainActivity : ComponentActivity() {
 
-    private var bluetooth by mutableStateOf<BluetoothNiNiel?>(null)
-    private val DEBUG_MODE = false
-    private var mockTemperature = 25.0
+    private val viewModel: BleViewModel by viewModels()
 
-    private lateinit var sharedPrefs: SharedPreferences
-    private val PREF_MAC_KEY = "last_device_mac"
-    private val TARGET_DEVICE_NAME = "ESP32-C3-NUS"
-    private var isScanning = false
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private var connectionTimeoutRunnable: Runnable? = null
+    companion object {
+        private const val DEBUG_MODE = false
+    }
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
@@ -57,8 +37,8 @@ class MainActivity : ComponentActivity() {
                 permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true
             }
 
-            if (granted && !DEBUG_MODE) {
-                initializeBluetooth()
+            if (granted) {
+                viewModel.initializeBluetooth()
             }
         }
 
@@ -66,8 +46,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-
-        sharedPrefs = getSharedPreferences("ble_prefs", Context.MODE_PRIVATE)
+        
+        viewModel.setDebug(DEBUG_MODE)
 
         if (!DEBUG_MODE) {
             val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -88,287 +68,21 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             DiddynielTheme {
-                val bluetoothData by bluetooth?.receivedData?.collectAsState("Searching...") ?: remember { mutableStateOf("Ready to Connect") }
+                val bluetoothData by viewModel.bleUartClient?.receivedData?.collectAsState("Searching...")
+                    ?: androidx.compose.runtime.remember { mutableStateOf("Ready to Connect") }
                 
                 Scaffold(
                     topBar = { TopAppBar(title = { Text("Thermostat Controller") }) }
                 ) { padding ->
                     ThermostatScreen(
                         modifier = Modifier.padding(padding),
-                        statusText = if (DEBUG_MODE) "%.1f".format(mockTemperature) else bluetoothData,
-                        onSetHotLimit = { limit -> 
-                            if (DEBUG_MODE) {
-                                mockTemperature = limit.toDoubleOrNull() ?: 45.0 
-                            } else {
-                                thread { 
-                                    bluetooth?.send("SETHOT $limit")
-                                    Thread.sleep(200)  // Wait for ESP32 to process
-                                    bluetooth?.send("GET")  // Refresh display
-                                }
-                            }
-                        },
-                        onSetColdLimit = { limit -> 
-                            if (DEBUG_MODE) {
-                                mockTemperature = limit.toDoubleOrNull() ?: 18.0 
-                            } else {
-                                thread { 
-                                    bluetooth?.send("SETCOLD $limit")
-                                    Thread.sleep(200)
-                                    bluetooth?.send("GET")  // Refresh display
-                                }
-                            }
-                        },
-                        onRefresh = {
-                            if (DEBUG_MODE) mockTemperature += (Math.random() - 0.5)
-                            else {
-                                val isNotConnected = bluetooth == null || 
-                                                     bluetoothData == "Disconnected" || 
-                                                     bluetoothData == "Ready to Connect" ||
-                                                     bluetoothData == "Searching..." ||
-                                                     bluetoothData == "Connecting..."
-                                
-                                if (isNotConnected) {
-                                    initializeBluetooth()
-                                } else {
-                                    thread { bluetooth?.send("GET") }
-                                }
-                            }
-                        }
+                        statusText = viewModel.getDisplayStatus(bluetoothData),
+                        onSetHotLimit = { viewModel.setHotLimit(it) },
+                        onSetColdLimit = { viewModel.setColdLimit(it) },
+                        onRefresh = { viewModel.refresh(bluetoothData) }
                     )
                 }
             }
         }
-    }
-
-    private fun initializeBluetooth() {
-        val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
-        val adapter = manager.adapter ?: return
-
-        stopScan()
-        cancelConnectionTimeout()
-
-        val cachedMac = sharedPrefs.getString(PREF_MAC_KEY, null)
-        if (cachedMac != null) {
-            Log.d("MainActivity", "Found cached MAC: $cachedMac. Attempting direct connection.")
-            try {
-                connectToDevice(adapter.getRemoteDevice(cachedMac))
-            } catch (e: Exception) {
-                Log.e("MainActivity", "Cached device error: ${e.message}")
-                sharedPrefs.edit().remove(PREF_MAC_KEY).apply()
-                startScan(adapter)
-            }
-        } else {
-            startScan(adapter)
-        }
-    }
-
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val device = result.device
-            @Suppress("MissingPermission")
-            val deviceName = device.name ?: result.scanRecord?.deviceName ?: "Unknown"
-            
-            val serviceUuids = result.scanRecord?.serviceUuids
-            val hasUartService = serviceUuids?.any { it.uuid == BluetoothNiNiel.SERVICE_UUID } ?: false
-
-            if (deviceName == TARGET_DEVICE_NAME || hasUartService) {
-                stopScan()
-                sharedPrefs.edit().putString(PREF_MAC_KEY, device.address).apply()
-                connectToDevice(device)
-            }
-        }
-
-        override fun onScanFailed(errorCode: Int) {
-            isScanning = false
-        }
-    }
-
-    private fun startScan(adapter: BluetoothAdapter) {
-        if (isScanning) return
-        val scanner = adapter.bluetoothLeScanner ?: return
-        isScanning = true
-        
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(BluetoothNiNiel.SERVICE_UUID))
-            .build()
-            
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
-
-        try {
-            scanner.startScan(listOf(filter), settings, scanCallback)
-            mainHandler.postDelayed({ if (isScanning) stopScan() }, 10000)
-        } catch (e: SecurityException) {
-            scanner.startScan(scanCallback)
-        }
-    }
-
-    private fun stopScan() {
-        if (!isScanning) return
-        val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
-        val scanner = manager.adapter?.bluetoothLeScanner ?: return
-        try {
-            scanner.stopScan(scanCallback)
-        } catch (e: Exception) {
-            e.printStackTrace()
-        } finally {
-            isScanning = false
-            mainHandler.removeCallbacksAndMessages(null)
-        }
-    }
-
-    private fun connectToDevice(device: android.bluetooth.BluetoothDevice) {
-        bluetooth?.close()
-        cancelConnectionTimeout()
-        
-        val bt = BluetoothNiNiel(this, device)
-        bt.onConnectionFailed = {
-            sharedPrefs.edit().remove(PREF_MAC_KEY).apply()
-            cancelConnectionTimeout()
-        }
-        bluetooth = bt
-
-        connectionTimeoutRunnable = Runnable {
-            if (bt.receivedData.value == "Connecting...") {
-                bt.close()
-                sharedPrefs.edit().remove(PREF_MAC_KEY).apply()
-            }
-        }
-        mainHandler.postDelayed(connectionTimeoutRunnable!!, 10000)
-
-        thread {
-            try {
-                bt.connect()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-    }
-
-    private fun cancelConnectionTimeout() {
-        connectionTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
-        connectionTimeoutRunnable = null
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        stopScan()
-        cancelConnectionTimeout()
-        bluetooth?.close()
-    }
-}
-
-@Composable
-fun ThermostatScreen(
-    modifier: Modifier = Modifier,
-    statusText: String,
-    onSetHotLimit: (String) -> Unit,
-    onSetColdLimit: (String) -> Unit,
-    onRefresh: () -> Unit
-) {
-    var showHotDialog by remember { mutableStateOf(false) }
-    var showColdDialog by remember { mutableStateOf(false) }
-    var tempLimitInput by remember { mutableStateOf("") }
-
-    val currentTemp = remember(statusText) {
-        statusText.filter { it.isDigit() || it == '.' }.toDoubleOrNull()
-    }
-
-    if (showHotDialog) {
-        AlertDialog(
-            onDismissRequest = { showHotDialog = false },
-            title = { Text("Set Hot Temp Limit") },
-            text = {
-                OutlinedTextField(
-                    value = tempLimitInput,
-                    onValueChange = { tempLimitInput = it },
-                    label = { Text("Temperature (°C)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    singleLine = true
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    onSetHotLimit(tempLimitInput)
-                    showHotDialog = false
-                    tempLimitInput = ""
-                }) { Text("Set") }
-            },
-            dismissButton = {
-                TextButton(onClick = { showHotDialog = false }) { Text("Cancel") }
-            }
-        )
-    }
-
-    if (showColdDialog) {
-        AlertDialog(
-            onDismissRequest = { showColdDialog = false },
-            title = { Text("Set Cold Temp Limit") },
-            text = {
-                OutlinedTextField(
-                    value = tempLimitInput,
-                    onValueChange = { tempLimitInput = it },
-                    label = { Text("Temperature (°C)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    singleLine = true
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    onSetColdLimit(tempLimitInput)
-                    showColdDialog = false
-                    tempLimitInput = ""
-                }) { Text("Set") }
-            },
-            dismissButton = {
-                TextButton(onClick = { showColdDialog = false }) { Text("Cancel") }
-            }
-        )
-    }
-
-    Column(
-        modifier = modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        val (icon, iconColor) = when {
-            currentTemp == null -> Icons.Default.Thermostat to Color.Gray
-            currentTemp <= 20.0 -> Icons.Default.AcUnit to Color(0xFF03A9F4)
-            currentTemp >= 40.0 -> Icons.Default.Whatshot to Color(0xFFFF5722)
-            else -> Icons.Default.Thermostat to Color(0xFF4CAF50)
-        }
-
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            modifier = Modifier.size(100.dp),
-            tint = iconColor
-        )
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        Text(
-            text = if (currentTemp != null) "Current Temperature" else "System Status", 
-            style = MaterialTheme.typography.headlineSmall,
-            textAlign = TextAlign.Center
-        )
-        
-        val displayStr = if (currentTemp != null) "$statusText°C" else statusText
-        Text(
-            text = displayStr, 
-            style = MaterialTheme.typography.displayLarge,
-            textAlign = TextAlign.Center
-        )
-        
-        Spacer(modifier = Modifier.height(32.dp))
-        
-        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            Button(onClick = { showColdDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF03A9F4))) { Text("COLD LIMIT") }
-            Button(onClick = { showHotDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5722))) { Text("HOT LIMIT") }
-        }
-        
-        Spacer(modifier = Modifier.height(32.dp))
-        Button(onClick = { onRefresh() }) { Text("Refresh") }
     }
 }
